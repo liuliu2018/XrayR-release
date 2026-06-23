@@ -5,13 +5,15 @@ green='\033[0;32m'
 yellow='\033[0;33m'
 plain='\033[0m'
 
-version="v1.0.0"
+shell_version="v1.0.0"
 
 # check root
 [[ $EUID -ne 0 ]] && echo -e "${red}错误: ${plain} 必须使用root用户运行此脚本！\n" && exit 1
 
 # check os
-if [[ -f /etc/redhat-release ]]; then
+if [[ -f /etc/alpine-release ]]; then
+    release="alpine"
+elif [[ -f /etc/redhat-release ]]; then
     release="centos"
 elif cat /etc/issue | grep -Eqi "debian"; then
     release="debian"
@@ -54,6 +56,7 @@ elif [[ x"${release}" == x"debian" ]]; then
 fi
 
 confirm() {
+    local temp
     if [[ $# > 1 ]]; then
         echo && read -p "$1 [默认$2]: " temp
         if [[ x"${temp}" == x"" ]]; then
@@ -79,6 +82,7 @@ confirm_restart() {
 }
 
 before_show_menu() {
+    local temp
     echo && echo -n -e "${yellow}按回车返回主菜单: ${plain}" && read temp
     show_menu
 }
@@ -95,23 +99,16 @@ install() {
 }
 
 update() {
+    local target_version
     if [[ $# == 0 ]]; then
-        echo && echo -n -e "输入指定版本(默认最新版): " && read version
+        echo && echo -n -e "输入指定版本(默认最新版): " && read target_version
     else
-        version=$2
+        target_version=$2
     fi
-#    confirm "本功能会强制重装当前最新版，数据不会丢失，是否继续?" "n"
-#    if [[ $? != 0 ]]; then
-#        echo -e "${red}已取消${plain}"
-#        if [[ $1 != 0 ]]; then
-#            before_show_menu
-#        fi
-#        return 0
-#    fi
-    bash <(curl -Ls https://raw.githubusercontent.com/XrayR-project/XrayR-release/master/install.sh) $version
+    bash <(curl -Ls https://raw.githubusercontent.com/XrayR-project/XrayR-release/master/install.sh) $target_version
     if [[ $? == 0 ]]; then
         echo -e "${green}更新完成，已自动重启 XrayR，请使用 XrayR log 查看运行日志${plain}"
-        exit
+        exit 0
     fi
 
     if [[ $# == 0 ]]; then
@@ -149,11 +146,19 @@ uninstall() {
         fi
         return 0
     fi
-    systemctl stop XrayR
-    systemctl disable XrayR
-    rm /etc/systemd/system/XrayR.service -f
-    systemctl daemon-reload
-    systemctl reset-failed
+    
+    if [[ x"${release}" == x"alpine" ]]; then
+        rc-service XrayR stop >/dev/null 2>&1
+        rc-update del XrayR default >/dev/null 2>&1
+        rm /etc/init.d/XrayR -f
+    else
+        systemctl stop XrayR
+        systemctl disable XrayR
+        rm /etc/systemd/system/XrayR.service -f
+        systemctl daemon-reload
+        systemctl reset-failed
+    fi
+    
     rm /etc/XrayR/ -rf
     rm /usr/local/XrayR/ -rf
 
@@ -172,7 +177,11 @@ start() {
         echo ""
         echo -e "${green}XrayR已运行，无需再次启动，如需重启请选择重启${plain}"
     else
-        systemctl start XrayR
+        if [[ x"${release}" == x"alpine" ]]; then
+            rc-service XrayR start >/dev/null 2>&1
+        else
+            systemctl start XrayR
+        fi
         sleep 2
         check_status
         if [[ $? == 0 ]]; then
@@ -188,7 +197,12 @@ start() {
 }
 
 stop() {
-    systemctl stop XrayR
+    if [[ x"${release}" == x"alpine" ]]; then
+        rc-service XrayR stop >/dev/null 2>&1
+    fi
+    if [[ x"${release}" != x"alpine" ]]; then
+        systemctl stop XrayR
+    fi
     sleep 2
     check_status
     if [[ $? == 1 ]]; then
@@ -203,7 +217,11 @@ stop() {
 }
 
 restart() {
-    systemctl restart XrayR
+    if [[ x"${release}" == x"alpine" ]]; then
+        rc-service XrayR restart >/dev/null 2>&1
+    else
+        systemctl restart XrayR
+    fi
     sleep 2
     check_status
     if [[ $? == 0 ]]; then
@@ -217,15 +235,26 @@ restart() {
 }
 
 status() {
-    systemctl status XrayR --no-pager -l
+    if [[ x"${release}" == x"alpine" ]]; then
+        rc-service XrayR status
+    else
+        systemctl status XrayR --no-pager -l
+    fi
     if [[ $# == 0 ]]; then
         before_show_menu
     fi
 }
 
 enable() {
-    systemctl enable XrayR
-    if [[ $? == 0 ]]; then
+    if [[ x"${release}" == x"alpine" ]]; then
+        rc-update add XrayR default >/dev/null 2>&1
+        local ret=$?
+    else
+        systemctl enable XrayR
+        local ret=$?
+    fi
+    
+    if [[ $ret == 0 ]]; then
         echo -e "${green}XrayR 设置开机自启成功${plain}"
     else
         echo -e "${red}XrayR 设置开机自启失败${plain}"
@@ -237,8 +266,15 @@ enable() {
 }
 
 disable() {
-    systemctl disable XrayR
-    if [[ $? == 0 ]]; then
+    if [[ x"${release}" == x"alpine" ]]; then
+        rc-update del XrayR default >/dev/null 2>&1
+        local ret=$?
+    else
+        systemctl disable XrayR
+        local ret=$?
+    fi
+    
+    if [[ $ret == 0 ]]; then
         echo -e "${green}XrayR 取消开机自启成功${plain}"
     else
         echo -e "${red}XrayR 取消开机自启失败${plain}"
@@ -250,56 +286,90 @@ disable() {
 }
 
 show_log() {
-    journalctl -u XrayR.service -e --no-pager -f
+    if [[ x"${release}" == x"alpine" ]]; then
+        if [ -f /var/log/messages ]; then
+            echo -e "${yellow}正在实时查看 Alpine 系统日志中 XrayR 的输出 (Ctrl+C 退出):${plain}"
+            tail -f /var/log/messages | grep XrayR
+        else
+            echo -e "${red}未检测到系统 syslog 文件（/var/log/messages）。请确认服务是否正常运行。${plain}"
+        fi
+    else
+        journalctl -u XrayR.service -e --no-pager -f
+    fi
+    
     if [[ $# == 0 ]]; then
         before_show_menu
     fi
 }
 
 install_bbr() {
-    bash <(curl -L -s https://raw.githubusercontent.com/chiakge/Linux-NetSpeed/master/tcp.sh)
-    #if [[ $? == 0 ]]; then
-    #    echo ""
-    #    echo -e "${green}安装 bbr 成功，请重启服务器${plain}"
-    #else
-    #    echo ""
-    #    echo -e "${red}下载 bbr 安装脚本失败，请检查本机能否连接 Github${plain}"
-    #fi
-
-    #before_show_menu
+    echo -e "${yellow}提示: Alpine Linux 内核机制特殊，一键BBR脚本通常无法顺利运行。 Ubuntu/Debian 则可正常执行。${plain}"
+    confirm "是否执意继续运行 BBR 脚本？" "n"
+    if [[ $? == 0 ]]; then
+        bash <(curl -L -s https://raw.githubusercontent.com/chiakge/Linux-NetSpeed/master/tcp.sh)
+    fi
 }
 
 update_shell() {
-    wget -O /usr/bin/XrayR -N --no-check-certificate https://raw.githubusercontent.com/XrayR-project/XrayR-release/master/XrayR.sh
-    if [[ $? != 0 ]]; then
-        echo ""
-        echo -e "${red}下载脚本失败，请检查本机能否连接 Github${plain}"
-        before_show_menu
+    echo -e "${yellow}注意：直接拉取官方原版脚本会覆盖掉当前的 Alpine 兼容性改动。${plain}"
+    confirm "是否确认覆盖当前维护脚本？" "n"
+    if [[ $? == 0 ]]; then
+        wget -O /usr/bin/XrayR -N --no-check-certificate https://raw.githubusercontent.com/XrayR-project/XrayR-release/master/XrayR.sh
+        if [[ $? != 0 ]]; then
+            echo ""
+            echo -e "${red}下载脚本失败，请检查本机能否连接 Github${plain}"
+            before_show_menu
+        else
+            chmod +x /usr/bin/XrayR
+            echo -e "${green}升级脚本成功，请重新运行脚本${plain}" && exit 0
+        fi
     else
-        chmod +x /usr/bin/XrayR
-        echo -e "${green}升级脚本成功，请重新运行脚本${plain}" && exit 0
+        if [[ $# == 0 ]]; then show_menu; fi
     fi
 }
 
 # 0: running, 1: not running, 2: not installed
 check_status() {
-    if [[ ! -f /etc/systemd/system/XrayR.service ]]; then
-        return 2
-    fi
-    temp=$(systemctl status XrayR | grep Active | awk '{print $3}' | cut -d "(" -f2 | cut -d ")" -f1)
-    if [[ x"${temp}" == x"running" ]]; then
-        return 0
+    if [[ x"${release}" == x"alpine" ]]; then
+        if [[ ! -f /etc/init.d/XrayR ]]; then
+            return 2
+        fi
+        rc-service XrayR status >/dev/null 2>&1
+        if [[ $? -eq 0 ]]; then
+            return 0
+        else
+            return 1
+        fi
     else
-        return 1
+        if [[ ! -f /etc/systemd/system/XrayR.service ]]; then
+            return 2
+        fi
+        local temp
+        temp=$(systemctl status XrayR | grep Active | awk '{print $3}' | cut -d "(" -f2 | cut -d ")" -f1)
+        if [[ x"${temp}" == x"running" ]]; then
+            return 0
+        else
+            return 1
+        fi
     fi
 }
 
 check_enabled() {
-    temp=$(systemctl is-enabled XrayR)
-    if [[ x"${temp}" == x"enabled" ]]; then
-        return 0
+    if [[ x"${release}" == x"alpine" ]]; then
+        rc-status default 2>/dev/null | grep -q XrayR
+        if [[ $? == 0 ]]; then
+            return 0
+        else
+            return 1
+        fi
     else
-        return 1;
+        local temp
+        temp=$(systemctl is-enabled XrayR 2>/dev/null)
+        if [[ x"${temp}" == x"enabled" ]]; then
+            return 0
+        else
+            return 1;
+        fi
     fi
 }
 
@@ -386,7 +456,7 @@ show_usage() {
 
 show_menu() {
     echo -e "
-  ${green}XrayR 后端管理脚本，${plain}${red}不适用于docker${plain}
+  ${green}XrayR 后端管理脚本 (${shell_version})，${plain}${red}不适用于docker${plain}
 --- https://github.com/XrayR-project/XrayR ---
   ${green}0.${plain} 修改配置
 ————————————————
@@ -407,7 +477,6 @@ show_menu() {
  ${green}12.${plain} 查看 XrayR 版本 
  ${green}13.${plain} 升级维护脚本
  "
- #后续更新可加入上方字符串中
     show_status
     echo && read -p "请输入选择 [0-13]: " num
 
@@ -440,11 +509,10 @@ show_menu() {
         ;;
         13) update_shell
         ;;
-        *) echo -e "${red}请输入正确的数字 [0-12]${plain}"
+        *) echo -e "${red}请输入正确的数字 [0-13]${plain}"
         ;;
     esac
 }
-
 
 if [[ $# > 0 ]]; then
     case $1 in
